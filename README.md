@@ -1,41 +1,49 @@
-# implicit-geometry
+# Implicit Geometry File Format (IFG)
 
-Implicit Geometry File Format (IFG)
+Jumpstart an open-source, JSON-centric format for defining implicit geometry. Our goal is to let designers describe shapes, lattices and Boolean operations in a human-readable graph and slice directly—no mesh export required.
 
-This repository kickstarts an open‐source, JSON‐based format for defining implicit geometry. Our aim is to let designers describe shapes, lattices and Boolean operations in a human‐readable graph, then slice directly—no mesh export needed.
+## What’s Included
 
-What’s Included
+- **Schema/**: minimal definitions for primitives (Cube, Sphere, Cylinder), transforms, booleans and lattices.
+- **Examples/**: `.ifg` files showing a 10 mm cube, a simple lattice-in-shell, etc.
+- **loader.py**: Python reference loader that reads an `.ifg`, builds the node graph and evaluates the implicit field at any `(x,y,z)`.
+- **pwsz_converter/**: contains `sampler.py` which generates PNG slices layer by layer and wraps them into a `.pm7m` file for Anycubic Photon Mono M7 Max.
 
-In this repo you’ll find:
-	•	A minimal schema under schema/ defining primitives (Cube, Sphere, Cylinder), transforms, booleans and lattices.
-	•	Sample .ifg files in examples/, including a basic 10 mm cube and a gyroid lattice demo.
-	•	A Python stub (loader.py) that reads an .ifg, reconstructs the node graph and evaluates the implicit field at a point.
-	•	A placeholder directory pwsz_converter/ where we’ll build the layer‐sampling to .pwsz utility.
+## Quick Start
 
-Quick Start
+1. Clone the repo:
+   ```bash
+   git clone https://github.com/your-org/ifg.git
+   cd ifg
+   ```
+2. Verify the loader on the cube example:
+   ```bash
+   python3 loader.py examples/cube.ifg
+   ```
+   You should see a field evaluation at the origin (e.g. `Field at (0,0,0): -5.0`).
 
-First, clone the repo and jump into the examples:
+3. Generate slices and package for your Photon Mono:
+   ```bash
+   python3 pwsz_converter/sampler.py
+   ```
+   - This writes PNG slices into `output_slices/` and produces `output.pm7m`.
 
-git clone https://github.com/your‐org/ifg.git
-cd ifg/examples
+4. Copy `output.pm7m` to your printer’s SD card and print.
 
-Then run the loader on the cube example:
+## Next Steps
 
-python3 ../loader.py cube.ifg
+- Enhance `loader.py` to support any custom node types or numerical tolerances.
+- Convert `sampler.py` into a CLI tool with flags for input path, layer thickness, resolution and output file.
+- Add bounding-box metadata support in your `.ifg` files to avoid hard-coded defaults.
+- Provide more examples (nested booleans, complex lattices) and automated tests.
 
-You should see a sample evaluation (for the cube, at the origin it should return -5.0, since it lies inside a 5 mm half‐extent cube).
+## Contributing
 
-Next Steps
+Contributions are welcome! Fork the repo, open issues for discussion, or submit pull requests to:
+- Add new primitives (e.g. torus, sweep profiles)
+- Improve performance (GPU acceleration hooks)
+- Extend the `.pm7m` metadata schema for printer settings
 
-Once you’ve confirmed the loader works, you can:
-	1.	Extend loader.py to handle all node types (Sphere, Union, Lattice, etc.).
-	2.	Write the sampling loop in pwsz_converter/ to generate bitmaps layer by layer.
-	3.	Wrap those bitmaps into a .pwsz file and test on your Photon Mono M7.
+## License
 
-Contributing
-
-We welcome collaboration. Whether you want to add new primitives, improve the Python loader, or prototype a CLI tool for .pwsz conversion, feel free to open an issue or send a pull request.
-
-License
-
-This project is released under the Apache 2.0 License—see LICENSE for details.
+Distributed under Apache 2.0. See `LICENSE` for details.
