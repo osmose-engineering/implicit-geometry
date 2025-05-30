@@ -1,0 +1,6 @@
+{
+  "metadata": { "format_version":"0.1","units":"mm" },
+  "nodes":[
+    {"id":"n1","type":"Cube","params":{"size":10},"inputs":[]}
+  ]
+}
