@@ -1,4 +1,6 @@
 import json, math, sys
+import trimesh
+import functools
 
 def load_ifg(path):
     with open(path,'r') as f:
@@ -61,8 +63,11 @@ def evaluate_node(node_id, nodes_map, x,y,z):
         lat = gyroid_field(x,y,z, cell)
         # lattice iso-surface at thickness
         return abs(lat) - thickness
-
-    raise ValueError(f"Unknown node type: {t}")
+    if t == 'Mesh':
+        mesh_path = p['filename']
+        distance_fn = get_mesh_signed_distance(mesh_path)
+        return distance_fn(x, y, z)
+        raise ValueError(f"Unknown node type: {t}")
 
 # Build an evaluator from the graph (root is last node)
 def build_evaluator(nodes):
@@ -80,3 +85,4 @@ if __name__ == '__main__':
     # sample at origin
     val = eval_fn(0,0,0)
     print(f"Field at (0,0,0): {val}")
+
