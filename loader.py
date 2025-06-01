@@ -2,6 +2,20 @@ import json, math, sys
 import trimesh
 import functools
 
+# Helper to load a mesh once and compute signed‐distance on demand
+@functools.lru_cache(maxsize=None)
+def get_mesh_signed_distance(mesh_path):
+    """
+    Load a watertight mesh from mesh_path and return a function that computes
+    signed distance for any (x,y,z) point.
+    """
+    mesh = trimesh.load(mesh_path)
+    # If the mesh has holes, fill them so that signed‐distance works correctly
+    if not mesh.is_watertight:
+        mesh = mesh.copy().fill_holes()
+    signed_distance = mesh.nearest.signed_distance
+    return lambda x, y, z: signed_distance([x, y, z])
+
 def load_ifg(path):
     with open(path,'r') as f:
         return json.load(f)
