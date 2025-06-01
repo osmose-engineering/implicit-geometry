@@ -5,7 +5,12 @@ import math
 import zipfile
 import argparse
 from PIL import Image
+from PIL import ImageDraw
+import shapely.geometry as geom
 import trimesh
+import numpy as np
+from shapely.geometry import Polygon, Point
+from shapely.ops import unary_union
 
 # Allow importing loader.py from parent directory
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -30,29 +35,231 @@ def generate_png_slices(ifg_path, output_dir, layer_thickness, res_x, res_y):
     2) Sample implicit field for each Z-slice, write PNGs to output_dir
     3) Return bounds and number of layers
     """
-    doc     = load_ifg(ifg_path)
-    eval_fn = build_evaluator(doc["nodes"])
-    meta    = doc.get("metadata", {})
-    bounds  = meta.get("bounds", {
-        "xmin": -5, "xmax": 5,
-        "ymin": -5, "ymax": 5,
-        "zmin": -5, "zmax": 5
-    })
+    import numpy as np
+
+    doc = load_ifg(ifg_path)
+    meta = doc.get("metadata", {})
+
+    # Ensure bounds exist and contain all required keys; otherwise infer from Mesh node
+    bounds = meta.get("bounds", {})
+    required = ["xmin", "xmax", "ymin", "ymax", "zmin", "zmax"]
+    if not all(k in bounds for k in required):
+        mesh_node = next((n for n in doc["nodes"] if n["type"] == "Mesh"), None)
+        if mesh_node is None:
+            raise RuntimeError("Cannot infer bounds: no Mesh node found in IFG.")
+        mesh_path = mesh_node["params"]["filename"]
+        mesh = trimesh.load(mesh_path)
+        if not mesh.is_watertight:
+            mesh.fill_holes()
+        min_corner, max_corner = mesh.bounds
+        bounds = {
+            "xmin": float(min_corner[0]),
+            "xmax": float(max_corner[0]),
+            "ymin": float(min_corner[1]),
+            "ymax": float(max_corner[1]),
+            "zmin": float(min_corner[2]),
+            "zmax": float(max_corner[2])
+        }
+        meta["bounds"] = bounds
+        doc["metadata"] = meta
 
     zmin, zmax = bounds["zmin"], bounds["zmax"]
     num_layers = int(math.ceil((zmax - zmin) / layer_thickness)) + 1
     os.makedirs(output_dir, exist_ok=True)
 
     print(f"→ Generating {num_layers} PNG slices from z={zmin} to {zmax}")
+
+    # Precompute XY grid for gyroid evaluation if needed
+    xs = np.linspace(bounds["xmin"], bounds["xmax"], res_x)
+    ys = np.linspace(bounds["ymin"], bounds["ymax"], res_y)
+    X, Y = np.meshgrid(xs, ys)  # shape (res_y, res_x)
+
+    # Detect if root node is a single Mesh for fast planar slicing
+    root_node = doc["nodes"][-1]
+    is_mesh_root = (root_node["type"] == "Mesh")
+
+    if is_mesh_root:
+        # Load mesh once
+        mesh_path = root_node["params"]["filename"]
+        mesh = trimesh.load(mesh_path)
+        if not mesh.is_watertight:
+            mesh.fill_holes()
+
+    # For CSG cases (e.g., shell + gyroid), prepare evaluator
+    eval_fn = None
+    if not is_mesh_root:
+        eval_fn = build_evaluator(doc["nodes"])
+        # Identify gyroid node parameters if present
+        gyroid_node = next((n for n in doc["nodes"] if n["type"] == "Lattice"), None)
+        if gyroid_node:
+            cell = gyroid_node["params"]["cell_size"]
+            thickness = gyroid_node["params"]["thickness"]
+            if isinstance(cell, (int, float)):
+                cx = cy = cz = cell
+            else:
+                cx, cy, cz = cell
+        else:
+            cell = None
+
+    # For CSG hybrid: prepare benchy_mesh and shrink_mesh once before the loop
+    if not is_mesh_root:
+        # Prepare meshes once before the loop
+        benchy_node = next((n for n in doc["nodes"] if n["type"] == "Mesh"), None)
+        shrink_node = next((n for n in doc["nodes"] if n["type"] == "Transform"), None)
+        benchy_mesh = trimesh.load(benchy_node["params"]["filename"])
+        if not benchy_mesh.is_watertight:
+            benchy_mesh.fill_holes()
+        scale_vals = shrink_node["params"]["scale"]
+        shrink_mesh = benchy_mesh.copy()
+        shrink_mesh.apply_scale(scale_vals)
+
     for i in range(num_layers):
+        print(f"Processing layer {i+1}/{num_layers}", end="\r", flush=True)
         z = zmin + i * layer_thickness
-        img = Image.new("L", (res_x, res_y))
-        for ix in range(res_x):
-            for iy in range(res_y):
-                x = bounds["xmin"] + ix * (bounds["xmax"] - bounds["xmin"]) / (res_x - 1)
-                y = bounds["ymin"] + iy * (bounds["ymax"] - bounds["ymin"]) / (res_y - 1)
-                field_val = eval_fn(x, y, z)
-                img.putpixel((ix, res_y - 1 - iy), 255 if field_val <= 0 else 0)
+
+        if is_mesh_root:
+            # Perform a planar section at z
+            section = mesh.section(plane_origin=[0, 0, z], plane_normal=[0, 0, 1])
+            if section is None:
+                img = Image.new("L", (res_x, res_y))
+            else:
+                planar = section.to_2D()[0]
+                img = Image.new("L", (res_x, res_y))
+                draw = ImageDraw.Draw(img)
+
+                scale_x = (res_x - 1) / (bounds["xmax"] - bounds["xmin"])
+                scale_y = (res_y - 1) / (bounds["ymax"] - bounds["ymin"])
+
+                try:
+                    polygons = planar.polygons_full
+                except ModuleNotFoundError:
+                    raise RuntimeError(
+                        "networkx is required for filled-polygon slicing. "
+                        "Please install it via 'pip install networkx' and retry."
+                    )
+
+                for polygon in polygons:
+                    exterior = [
+                        (
+                            int((x - bounds["xmin"]) * scale_x),
+                            int((bounds["ymax"] - y) * scale_y)
+                        )
+                        for x, y in polygon.exterior.coords
+                    ]
+                    draw.polygon(exterior, fill=255)
+                    for interior in polygon.interiors:
+                        interior_pts = [
+                            (
+                                int((x - bounds["xmin"]) * scale_x),
+                                int((bounds["ymax"] - y) * scale_y)
+                            )
+                            for x, y in interior.coords
+                        ]
+                        draw.polygon(interior_pts, fill=0)
+
+        else:
+            # Hybrid CSG slicing: shell (subtract) + gyroid
+            # 2) Get planar sections (benchy and shrink) at this z-level
+            benchy_section = benchy_mesh.section(plane_origin=[0, 0, z], plane_normal=[0, 0, 1])
+            shrink_section = shrink_mesh.section(plane_origin=[0, 0, z], plane_normal=[0, 0, 1])
+
+            # Convert to planar 2D Path and collect polygons
+            benchy_polygons = []
+            if benchy_section is not None:
+                be_planar = benchy_section.to_2D()[0]
+                try:
+                    benchy_polygons = [
+                        Polygon(p.exterior.coords, [h.coords for h in p.interiors])
+                        for p in be_planar.polygons_full
+                    ]
+                except ModuleNotFoundError:
+                    raise RuntimeError(
+                        "networkx is required for filled-polygon slicing. "
+                        "Please install it via 'pip install networkx' and retry."
+                    )
+
+            shrink_polygons = []
+            if shrink_section is not None:
+                sh_planar = shrink_section.to_2D()[0]
+                shrink_polygons = [
+                    Polygon(p.exterior.coords, [h.coords for h in p.interiors])
+                    for p in sh_planar.polygons_full
+                ]
+
+            # 3) Rasterize shrink_polygons to shrink_mask via PIL
+            scale_x = (res_x - 1) / (bounds["xmax"] - bounds["xmin"])
+            scale_y = (res_y - 1) / (bounds["ymax"] - bounds["ymin"])
+            shrink_img = Image.new("L", (res_x, res_y), 0)
+            shr_draw  = ImageDraw.Draw(shrink_img)
+            for poly in shrink_polygons:
+                # Draw exterior
+                ext_pts = [
+                    (
+                        int((px - bounds["xmin"]) * scale_x),
+                        int((bounds["ymax"] - py) * scale_y)
+                    )
+                    for (px, py) in poly.exterior.coords
+                ]
+                shr_draw.polygon(ext_pts, fill=255)
+                # Draw holes
+                for interior in poly.interiors:
+                    hole_pts = [
+                        (
+                            int((px - bounds["xmin"]) * scale_x),
+                            int((bounds["ymax"] - py) * scale_y)
+                        )
+                        for (px, py) in interior.coords
+                    ]
+                    shr_draw.polygon(hole_pts, fill=0)
+            shrink_mask = np.array(shrink_img)
+
+            # 4) Rasterize benchy_polygons via PIL, then subtract shrink_mask to get shell_mask
+            shell_mask = np.zeros((res_y, res_x), dtype=np.uint8)
+            if benchy_polygons:
+                benchy_img = Image.new("L", (res_x, res_y), 0)
+                bn_draw    = ImageDraw.Draw(benchy_img)
+                for poly in benchy_polygons:
+                    ext_pts = [
+                        (
+                            int((px - bounds["xmin"]) * scale_x),
+                            int((bounds["ymax"] - py) * scale_y)
+                        )
+                        for (px, py) in poly.exterior.coords
+                    ]
+                    bn_draw.polygon(ext_pts, fill=255)
+                    for interior in poly.interiors:
+                        hole_pts = [
+                            (
+                                int((px - bounds["xmin"]) * scale_x),
+                                int((bounds["ymax"] - py) * scale_y)
+                            )
+                            for (px, py) in interior.coords
+                        ]
+                        bn_draw.polygon(hole_pts, fill=0)
+                benchy_mask = np.array(benchy_img)
+                shell_mask = benchy_mask.copy()
+                shell_mask[shrink_mask == 255] = 0
+
+            # 5) Compute gyroid mask if gyroid is present
+            if cell is not None:
+                Z = np.full_like(X, z)
+                gy = (
+                    np.sin(2 * np.pi * X / cx) * np.cos(2 * np.pi * Y / cy) +
+                    np.sin(2 * np.pi * Y / cy) * np.cos(2 * np.pi * Z / cz) +
+                    np.sin(2 * np.pi * Z / cz) * np.cos(2 * np.pi * X / cx)
+                )
+                gy_mask = (np.abs(gy) <= thickness).astype(np.uint8) * 255
+            else:
+                gy_mask = np.zeros((res_y, res_x), dtype=np.uint8)
+
+            # 6) Compute interior gyroid: points inside shrink and gyroid
+            interior_mask = np.zeros((res_y, res_x), dtype=np.uint8)
+            interior_mask[(gy_mask == 255) & (shrink_mask == 255)] = 255
+            # 7) Final mask = shell OR interior gyroid
+            final_mask = np.zeros((res_y, res_x), dtype=np.uint8)
+            final_mask[(shell_mask == 255) | (interior_mask == 255)] = 255
+
+            img = Image.fromarray(final_mask, mode="L")
 
         slice_path = os.path.join(output_dir, f"slice_{i:04d}.png")
         img.save(slice_path)
@@ -162,8 +369,19 @@ if __name__ == "__main__":
         default=DEFAULT_FORMAT,
         help="Choose 'pwsz' (Anycubic) or 'ctb' (ChituBox)."
     )
+    parser.add_argument(
+        "--infill-gyroid",
+        metavar=("CELL_SIZE", "THICKNESS"),
+        nargs=2,
+        type=float,
+        help=(
+            "If provided, create a gyroid infill inside any Mesh node. "
+            "Two floats: <cell_size> <thickness> in model units."
+        )
+    )
 
     args = parser.parse_args()
+    ifg_to_slice = args.ifg_path
 
     # Load IFG document to inspect metadata and nodes
     doc = load_ifg(args.ifg_path)
@@ -189,11 +407,59 @@ if __name__ == "__main__":
         }
         doc["metadata"] = meta
 
+    # If the user requested a gyroid infill, inject nodes into the IFG
+    if args.infill_gyroid:
+        cell_size, thickness = args.infill_gyroid
+        # Find the first Mesh node
+        mesh_node = next((n for n in doc["nodes"] if n["type"] == "Mesh"), None)
+        if mesh_node is None:
+            raise RuntimeError("Cannot add gyroid infill: no Mesh node found.")
+        # Create a Lattice node for the gyroid
+        infill_id = "infill_gyroid"
+        lattice_node = {
+            "id": infill_id,
+            "type": "Lattice",
+            "params": {
+                "cell_size": cell_size,
+                "thickness": thickness
+            },
+            "inputs": []
+        }
+        # Create an Intersect node to carve the gyroid inside the mesh
+        intersect_id = "gyroid_interior"
+        intersect_node = {
+            "id": intersect_id,
+            "type": "Intersect",
+            "params": {},
+            "inputs": [mesh_node["id"], infill_id]
+        }
+        # Create a Union node to combine the mesh shell and the interior gyroid
+        final_id = "mesh_with_gyroid"
+        union_node = {
+            "id": final_id,
+            "type": "Union",
+            "params": {},
+            "inputs": [mesh_node["id"], intersect_id]
+        }
+        # Append new nodes to the document
+        doc["nodes"].append(lattice_node)
+        doc["nodes"].append(intersect_node)
+        doc["nodes"].append(union_node)
+        # The last node is now the root for sampling
+
+        # After injecting nodes, write updated IFG to a temporary file
+        temp_ifg_path = args.ifg_path.replace(".ifg", "_infill.ifg")
+        with open(temp_ifg_path, "w") as tf:
+            json.dump(doc, tf, indent=2)
+        # Use this new IFG for slicing
+        ifg_to_slice = temp_ifg_path
+
     # Now generate slices using (possibly) updated bounds
     bounds, num_layers = generate_png_slices(
-        args.ifg_path, args.slice_dir,
+        ifg_to_slice, args.slice_dir,
         args.layer_thickness, args.res_x, args.res_y
     )
+
 
     if args.fmt == "pwsz":
         output_file = f"{args.output_base}.pwsz"

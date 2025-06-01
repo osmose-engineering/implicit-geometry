@@ -1,0 +1,11 @@
+{
+  "metadata": { "format_version": "0.1", "units": "mm", "bounds": {} },
+  "nodes": [
+    { "id": "benchy", "type": "Mesh", "params": { "filename": "examples/3dbenchy.stl" }, "inputs": [] },
+    { "id": "shrink", "type": "Transform", "params": { "translate":[0,0,0], "rotate":[0,0,0], "scale":[0.98,0.98,0.98] }, "inputs":["benchy"] },
+    { "id": "shell", "type": "Subtract", "params": {}, "inputs":["benchy","shrink"] },
+    { "id": "gyroid", "type": "Lattice", "params": { "cell_size":5.0, "thickness":0.5 }, "inputs":[] },
+    { "id": "interiorGyroid", "type": "Intersect", "params": {}, "inputs":["shrink","gyroid"] },
+    { "id": "final", "type": "Union", "params": {}, "inputs":["shell","interiorGyroid"] }
+  ]
+}

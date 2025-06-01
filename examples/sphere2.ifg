@@ -1,0 +1,24 @@
+{
+  "metadata": {
+    "format_version": "0.1",
+    "units": "mm",
+    "bounds": {
+      "xmin": -1.0,
+      "xmax": 1.0,
+      "ymin": -1.0,
+      "ymax": 1.0,
+      "zmin": -1.0,
+      "zmax": 1.0
+    }
+  },
+  "nodes": [
+    {
+      "id": "mesh1",
+      "type": "Mesh",
+      "params": {
+        "filename": "examples/sphere.stl"
+      },
+      "inputs": []
+    }
+  ]
+}

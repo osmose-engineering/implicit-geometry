@@ -9,15 +9,33 @@ def get_mesh_signed_distance(mesh_path):
     Load a watertight mesh from mesh_path and return a function that computes
     signed distance for any (x,y,z) point.
     """
-    mesh = trimesh.load(mesh_path)
-    # If the mesh has holes, try to fill them so that winding/contains works
-    if not mesh.is_watertight:
-        mesh = mesh.copy().fill_holes()
+    # Try loading strictly as a mesh
+    try:
+        mesh_candidate = trimesh.load_mesh(mesh_path)
+    except Exception:
+        mesh_candidate = None
 
-    # Compute unsigned distance via on_surface, then check contains for sign
+    # If load_mesh failed or returned a non-Trimesh, fall back to load a scene
+    if not isinstance(mesh_candidate, trimesh.Trimesh):
+        scene = trimesh.load(mesh_path)
+        if isinstance(scene, trimesh.Scene) and scene.geometry:
+            mesh = next(iter(scene.geometry.values()))
+        else:
+            raise ValueError(f"Failed to load a valid mesh from '{mesh_path}'")
+    else:
+        mesh = mesh_candidate
+
+    # Ensure we have a Trimesh
+    if not isinstance(mesh, trimesh.Trimesh):
+        raise ValueError(f"Loaded object is not a mesh: {type(mesh)}")
+
+    # Ensure the mesh is watertight; fill holes in place if not
+    if not mesh.is_watertight:
+        mesh.fill_holes()
+
+    # Compute signed distance: unsigned via on_surface, then sign via contains
     def signed_dist(x, y, z):
         pt = [x, y, z]
-        # nearest.on_surface returns (closest_points, distances, face_indices)
         closest, distances, _ = mesh.nearest.on_surface([pt])
         dist = distances[0]
         inside = mesh.contains([pt])[0]
@@ -41,11 +59,17 @@ def cylinder_field(x,y,z,radius,height):
     return max(math.sqrt(x*x + y*y) - radius, abs(z) - height/2.0)
 
 # Lattice pattern (gyroid)
-def gyroid_field(x,y,z,cell_size):
-    cx,cy,cz = cell_size
-    return ( math.cos(2*math.pi*x/cx)
-           + math.cos(2*math.pi*y/cy)
-           + math.cos(2*math.pi*z/cz) )
+def gyroid_field(x, y, z, cell_size):
+    # Allow cell_size to be a single float or a tuple of three floats
+    if isinstance(cell_size, (int, float)):
+        cx = cy = cz = cell_size
+    else:
+        cx, cy, cz = cell_size
+    return (
+        math.sin(2 * math.pi * x / cx) * math.cos(2 * math.pi * y / cy) +
+        math.sin(2 * math.pi * y / cy) * math.cos(2 * math.pi * z / cz) +
+        math.sin(2 * math.pi * z / cz) * math.cos(2 * math.pi * x / cx)
+    )
 
 # Core evaluator
 
