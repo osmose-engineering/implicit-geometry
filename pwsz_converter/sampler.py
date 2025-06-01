@@ -5,6 +5,7 @@ import math
 import zipfile
 import argparse
 from PIL import Image
+import trimesh
 
 # Allow importing loader.py from parent directory
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -164,6 +165,31 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
+    # Load IFG document to inspect metadata and nodes
+    doc = load_ifg(args.ifg_path)
+    meta = doc.get("metadata", {})
+
+    # If no bounds are provided, infer from any Mesh node
+    if "bounds" not in meta:
+        mesh_node = next((n for n in doc["nodes"] if n["type"] == "Mesh"), None)
+        if mesh_node is None:
+            raise RuntimeError("No bounds in metadata and no Mesh node to infer them from.")
+        mesh_path = mesh_node["params"]["filename"]
+        mesh = trimesh.load(mesh_path)
+        if not mesh.is_watertight:
+            mesh = mesh.copy().fill_holes()
+        min_corner, max_corner = mesh.bounds
+        meta["bounds"] = {
+            "xmin": float(min_corner[0]),
+            "xmax": float(max_corner[0]),
+            "ymin": float(min_corner[1]),
+            "ymax": float(max_corner[1]),
+            "zmin": float(min_corner[2]),
+            "zmax": float(max_corner[2])
+        }
+        doc["metadata"] = meta
+
+    # Now generate slices using (possibly) updated bounds
     bounds, num_layers = generate_png_slices(
         args.ifg_path, args.slice_dir,
         args.layer_thickness, args.res_x, args.res_y

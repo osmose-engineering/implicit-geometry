@@ -2,7 +2,7 @@ import json, math, sys
 import trimesh
 import functools
 
-# Helper to load a mesh once and compute signed‐distance on demand
+# Helper to load a mesh once and compute signed-distance on demand
 @functools.lru_cache(maxsize=None)
 def get_mesh_signed_distance(mesh_path):
     """
@@ -10,11 +10,20 @@ def get_mesh_signed_distance(mesh_path):
     signed distance for any (x,y,z) point.
     """
     mesh = trimesh.load(mesh_path)
-    # If the mesh has holes, fill them so that signed‐distance works correctly
+    # If the mesh has holes, try to fill them so that winding/contains works
     if not mesh.is_watertight:
         mesh = mesh.copy().fill_holes()
-    signed_distance = mesh.nearest.signed_distance
-    return lambda x, y, z: signed_distance([x, y, z])
+
+    # Compute unsigned distance via on_surface, then check contains for sign
+    def signed_dist(x, y, z):
+        pt = [x, y, z]
+        # nearest.on_surface returns (closest_points, distances, face_indices)
+        closest, distances, _ = mesh.nearest.on_surface([pt])
+        dist = distances[0]
+        inside = mesh.contains([pt])[0]
+        return -dist if inside else dist
+
+    return signed_dist
 
 def load_ifg(path):
     with open(path,'r') as f:
@@ -100,4 +109,3 @@ if __name__ == '__main__':
     # sample at origin
     val = eval_fn(0,0,0)
     print(f"Field at (0,0,0): {val}")
-
