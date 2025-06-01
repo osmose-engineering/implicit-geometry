@@ -98,6 +98,60 @@ Once generated, `your_part.ifg` can be sliced without further manual edits.
    - Open `cube_print.ctb` in ChituBox. You should see your layer stack with default exposure settings.  
    - If you generated a `.pwsz`, drop it into Anycubic’s slicer. Verify layers appear correctly.
 
+### Gyroid Infill Support
+
+In addition to slicing solid implicit models, the `sampler.py` script can automatically generate gyroid infill within a mesh. You have two options:
+
+1. **On-the-fly infill via CLI**  
+   Pass the `--infill-gyroid <cell_size> <thickness>` arguments to `sampler.py` along with your IFG. For example:
+   ```bash
+   python3 pwsz_converter/sampler.py \
+     --ifg examples/benchy.ifg \
+     --out benchy_with_gyroid \
+     --dir output_slices \
+     --slice_thick 0.05 \
+     --resx 512 \
+     --resy 512 \
+     --format ctb \
+     --infill-gyroid 5.0 0.5
+   ```
+   This will:
+   - Create an inner (scaled) copy of the mesh to define a hollow shell.  
+   - Subtract the inner copy to extract a thin shell.  
+   - Generate a gyroid lattice (with `cell_size` and `thickness`) inside that shell.  
+   - Combine shell and infill into a single implicit tree.  
+   - Slice using a hybrid approach (planar shell + vectorized 2D gyroid) for fast performance.
+
+2. **Prebuilt infill IFG**  
+   Alternatively, write an IFG that contains:
+   ```json
+   {
+     "metadata": { "format_version": "0.1", "units": "mm", "bounds": {} },
+     "nodes": [
+       { "id": "mesh", "type": "Mesh", "params": { "filename": "examples/3dbenchy.stl" }, "inputs": [] },
+       { "id": "shrink", "type": "Transform", "params": { "translate":[0,0,0], "rotate":[0,0,0], "scale":[0.98,0.98,0.98] }, "inputs":["mesh"] },
+       { "id": "shell", "type": "Subtract", "params": {}, "inputs":["mesh","shrink"] },
+       { "id": "gyroid", "type": "Lattice", "params": { "cell_size":5.0, "thickness":0.5 }, "inputs":[] },
+       { "id": "interiorGyroid", "type": "Intersect", "params": {}, "inputs":["shrink","gyroid"] },
+       { "id": "final", "type": "Union", "params": {}, "inputs":["shell","interiorGyroid"] }
+     ]
+   }
+   ```
+   Save it as, for example, `examples/benchy_hollow_gyroid.ifg`, then slice normally:
+   ```bash
+   python3 pwsz_converter/sampler.py \
+     --ifg examples/benchy_hollow_gyroid.ifg \
+     --out benchy_filled_hollow \
+     --dir output_slices \
+     --slice_thick 0.05 \
+     --resx 512 \
+     --resy 512 \
+     --format ctb
+   ```
+   The sampler will detect the shell + infill tree and use a fast hybrid slicing method that combines planar mesh sections (for the shell) and vectorized 2D gyroid masks for the interior.
+
+Below either approach, the output PNG stack and final `.ctb` or `.pwsz` file will show the Benchy with a gyroid infill inside a thin shell.
+
 ## Dynamic Bounds Detection
 
 `pwsz_converter/sampler.py` automatically checks for `metadata.bounds` in the IFG. If missing, it locates the first `Mesh` node, loads the STL, and uses `mesh.bounds` to infer:
@@ -107,7 +161,8 @@ This removes the need to hand‐edit bounds for unknown meshes. Simply point at 
 
 ## Next Steps
 
-- Extend `loader.py` to add new implicit primitives (Torus, Sweep profiles, etc.).
+- Create and combine primitive shapes (Cube, Sphere, Cylinder, etc.) directly in IFG; no STL needed.
+- Extend `loader.py` to add more implicit primitives (Torus, Sweep profiles, etc.).
 - Enhance `sampler.py` to allow custom CTB parameters (e.g., exposure times, resin profiles).
 - Add more example IFGs under `examples/` (nested Booleans, multi‐material lattices, complex meshes).
 - Write automated tests to confirm each IFG node evaluates correctly (primitives, lattices, meshes).
