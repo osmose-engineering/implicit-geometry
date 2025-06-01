@@ -67,7 +67,8 @@ def evaluate_node(node_id, nodes_map, x,y,z):
         mesh_path = p['filename']
         distance_fn = get_mesh_signed_distance(mesh_path)
         return distance_fn(x, y, z)
-        raise ValueError(f"Unknown node type: {t}")
+    
+    raise ValueError(f"Unknown node type: {t}")
 
 # Build an evaluator from the graph (root is last node)
 def build_evaluator(nodes):
