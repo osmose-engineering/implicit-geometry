@@ -1,20 +1,107 @@
 import os
 import sys
+
+# Insert project root and implicit_core onto sys.path
+project_root = os.path.dirname(os.path.abspath(__file__))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+implicit_core_path = os.path.join(project_root, "implicit_core")
+if implicit_core_path not in sys.path:
+    sys.path.insert(0, implicit_core_path)
+
 import json
 import math
 import zipfile
 import argparse
+import numpy as np
 from PIL import Image
 from PIL import ImageDraw
 import shapely.geometry as geom
 import trimesh
-import numpy as np
 from shapely.geometry import Polygon, Point
 from shapely.ops import unary_union
+
+
+# --- Exporter wrappers ---
+from exporters.ctb_exporter import create_ctb_archive as wrap_to_ctb
+from exporters.anycubic_exporter import create_anycubic_archive as wrap_to_pwsz
 
 # Allow importing loader.py from parent directory
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from loader import load_ifg, build_evaluator
+
+# -----------------------------------------------
+# Helper: recursively build SDF evaluator for simple SDF/boolean IFG
+# -----------------------------------------------
+def _build_sdf_eval(doc):
+    """
+    Recursively build an SDF evaluator from a loaded IFG document (handling both
+    'nodes' and simple 'sdf' boolean or sphere definitions).
+    """
+    # If node-based IFG, delegate to loader
+    if "nodes" in doc:
+        return build_evaluator(doc["nodes"])
+    # Otherwise, simple SDF-based IFG
+    sdf_meta = doc.get("sdf", {})
+    kind = sdf_meta.get("kind")
+    # Sphere
+    if kind == "sphere":
+        cx, cy, cz = sdf_meta.get("center", [0.0, 0.0, 0.0])
+        radius = sdf_meta.get("radius", 0.0)
+        def eval_fn(x, y, z):
+            dx = x - cx; dy = y - cy; dz = z - cz
+            return (dx*dx + dy*dy + dz*dz)**0.5 - radius
+        return eval_fn
+    # Box
+    if kind == "box":
+        cx, cy, cz = sdf_meta.get("center", [0.0, 0.0, 0.0])
+        hx, hy, hz = sdf_meta.get("halfwidths", [0.0, 0.0, 0.0])
+        def eval_fn(x, y, z):
+            dx = abs(x - cx) - hx
+            dy = abs(y - cy) - hy
+            dz = abs(z - cz) - hz
+            # outside distances
+            ux = max(dx, 0.0)
+            uy = max(dy, 0.0)
+            uz = max(dz, 0.0)
+            outside_dist = (ux*ux + uy*uy + uz*uz) ** 0.5
+            # inside distance (negative)
+            inside_dist = min(max(dx, max(dy, dz)), 0.0)
+            return outside_dist + inside_dist
+        return eval_fn
+
+    # Gyroid lattice
+    if kind == "gyroid":
+        # Extract parameters
+        cell = sdf_meta.get("cell_size")
+        thickness = sdf_meta.get("thickness", 0.0)
+        # If cell is a single float, use it for all axes
+        if isinstance(cell, (int, float)):
+            cx = cy = cz = cell
+        else:
+            cx, cy, cz = cell
+        def eval_fn(x, y, z):
+            gy = (
+                math.sin(2 * math.pi * x / cx) * math.cos(2 * math.pi * y / cy) +
+                math.sin(2 * math.pi * y / cy) * math.cos(2 * math.pi * z / cz) +
+                math.sin(2 * math.pi * z / cz) * math.cos(2 * math.pi * x / cx)
+            )
+            return abs(gy) - thickness
+        return eval_fn
+    # Boolean combine
+    if kind in ("union", "intersect", "subtract"):
+        inputs = sdf_meta.get("inputs", [])
+        child_evals = []
+        for inp in inputs:
+            child_doc = load_ifg(inp)
+            child_evals.append(_build_sdf_eval(child_doc))
+        if kind == "union":
+            return lambda x, y, z: min(f(x, y, z) for f in child_evals)
+        elif kind == "intersect":
+            return lambda x, y, z: max(f(x, y, z) for f in child_evals)
+        else:  # subtract
+            return lambda x, y, z: max(child_evals[0](x, y, z), -child_evals[1](x, y, z))
+    raise ValueError(f"Unsupported simple SDF kind: {kind}")
 
 # -----------------------------------------------
 # PARAMETERS (Overrides via CLI flags)
@@ -38,6 +125,58 @@ def generate_png_slices(ifg_path, output_dir, layer_thickness, res_x, res_y):
     import numpy as np
 
     doc = load_ifg(ifg_path)
+
+    # Handle simple IFG containing only a single-sphere SDF (no "nodes" key)
+    if "sdf" in doc and "nodes" not in doc:
+        sdf_meta = doc["sdf"]
+        kind = sdf_meta.get("kind")
+        if kind == "sphere":
+            cx, cy, cz = sdf_meta.get("center", [0.0, 0.0, 0.0])
+            radius = sdf_meta.get("radius", 0.0)
+            def eval_fn(x, y, z):
+                dx = x - cx
+                dy = y - cy
+                dz = z - cz
+                dist = (dx*dx + dy*dy + dz*dz) ** 0.5
+                return dist - radius
+            # Use bounds from IFG document directly
+            bounds = doc.get("bounds", {})
+            zmin, zmax = bounds["zmin"], bounds["zmax"]
+            num_layers = int(math.ceil((zmax - zmin) / layer_thickness)) + 1
+            os.makedirs(output_dir, exist_ok=True)
+            xs = np.linspace(bounds["xmin"], bounds["xmax"], res_x)
+            ys = np.linspace(bounds["ymin"], bounds["ymax"], res_y)
+            for i, z in enumerate(np.linspace(zmin, zmax, num_layers)):
+                xv, yv = np.meshgrid(xs, ys, indexing="xy")
+                points = np.vstack((xv.ravel(), yv.ravel(), np.full_like(xv.ravel(), z))).T
+                field_vals = np.array([eval_fn(px, py, pz) for px, py, pz in points])
+                img_arr = (255 * (field_vals.reshape((res_y, res_x)) < 0)).astype(np.uint8)
+                img = Image.fromarray(img_arr, mode="L")
+                slice_path = os.path.join(output_dir, f"slice_{i:04d}.png")
+                img.save(slice_path)
+            return bounds, num_layers
+        # Handle simple IFG containing only a simple boolean combine (no "nodes" key)
+        sdf_meta = doc["sdf"]
+        kind = sdf_meta.get("kind")
+        # Build a single evaluator for this combined IFG
+        eval_fn = _build_sdf_eval(doc)
+        # Use bounds from IFG metadata
+        bounds = doc.get("bounds", {})
+        zmin, zmax = bounds["zmin"], bounds["zmax"]
+        num_layers = int(math.ceil((zmax - zmin) / layer_thickness)) + 1
+        os.makedirs(output_dir, exist_ok=True)
+        xs = np.linspace(bounds["xmin"], bounds["xmax"], res_x)
+        ys = np.linspace(bounds["ymin"], bounds["ymax"], res_y)
+        for i, z in enumerate(np.linspace(zmin, zmax, num_layers)):
+            xv, yv = np.meshgrid(xs, ys, indexing="xy")
+            points = np.vstack((xv.ravel(), yv.ravel(), np.full_like(xv.ravel(), z))).T
+            field_vals = np.array([eval_fn(px, py, pz) for px, py, pz in points])
+            img_arr = (255 * (field_vals.reshape((res_y, res_x)) < 0)).astype(np.uint8)
+            img = Image.fromarray(img_arr, mode="L")
+            slice_path = os.path.join(output_dir, f"slice_{i:04d}.png")
+            img.save(slice_path)
+        return bounds, num_layers
+
     meta = doc.get("metadata", {})
 
     # Ensure bounds exist and contain all required keys; otherwise infer from Mesh node
@@ -266,72 +405,6 @@ def generate_png_slices(ifg_path, output_dir, layer_thickness, res_x, res_y):
 
     return bounds, num_layers
 
-# -----------------------------------------------
-# WRAPPER: pack PNG slices into a .pwsz archive
-# -----------------------------------------------
-def wrap_to_pwsz(slice_dir, output_file, bounds, res_x, res_y, layer_thickness):
-    """
-    Write a .pwsz ZIP with:
-      - Info.json
-      - Body/0000, Body/0001, … (no extension), raw PNG bytes
-    """
-    info = {
-        "ResX": res_x,
-        "ResY": res_y,
-        "LayerThickness": layer_thickness,
-        "FlipX": False,
-        "FlipY": False,
-        "Invert": False,
-        "OriginX": bounds["xmin"],
-        "OriginY": bounds["ymin"],
-        "PixelSizeX": (bounds["xmax"] - bounds["xmin"]) / (res_x - 1),
-        "PixelSizeY": (bounds["ymax"] - bounds["ymin"]) / (res_y - 1)
-    }
-
-    with zipfile.ZipFile(output_file, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr("Info.json", json.dumps(info))
-        png_files = sorted(f for f in os.listdir(slice_dir) if f.endswith(".png"))
-        for idx, fname in enumerate(png_files):
-            layer_name = f"{idx:04d}"
-            arcname = f"Body/{layer_name}"
-            zf.write(os.path.join(slice_dir, fname), arcname)
-
-    print(f"✓ Packaged {len(png_files)} slices into {output_file} (PWSZ format)")
-
-# -----------------------------------------------
-# WRAPPER: pack PNG slices into a .ctb archive
-# -----------------------------------------------
-def wrap_to_ctb(slice_dir, output_file, bounds, res_x, res_y, layer_thickness):
-    """
-    Write a .ctb ZIP with:
-      - Info.json (CTB-specific keys)
-      - Body/0000.png, Body/0001.png, …
-    """
-    info = {
-        "Version":           1,
-        "Width":             res_x,
-        "Height":            res_y,
-        "LayerHeight":       layer_thickness,
-        "ExposureTime":      2.0,
-        "BottomLayerCount":  5,
-        "BottomExposureTime": 30.0,
-        "OffTime":           0.0,
-        "TiltCompensation":  0,
-        "OriginX":           bounds["xmin"],
-        "OriginY":           bounds["ymin"],
-        "PixelSizeX":        (bounds["xmax"] - bounds["xmin"]) / (res_x - 1),
-        "PixelSizeY":        (bounds["ymax"] - bounds["ymin"]) / (res_y - 1)
-    }
-
-    with zipfile.ZipFile(output_file, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr("Info.json", json.dumps(info))
-        png_files = sorted(f for f in os.listdir(slice_dir) if f.endswith(".png"))
-        for idx, fname in enumerate(png_files):
-            layer_name = f"{idx:04d}.png"
-            arcname = f"Body/{layer_name}"
-            zf.write(os.path.join(slice_dir, fname), arcname)
-
-    print(f"✓ Packaged {len(png_files)} slices into {output_file} (CTB format)")
 
 # -----------------------------------------------
 # COMMAND-LINE INTERFACE
@@ -381,6 +454,19 @@ if __name__ == "__main__":
     )
 
     args = parser.parse_args()
+    # Redirect all outputs into a dedicated directory
+    # Determine base output path from args.output_base
+    output_base = args.output_base
+    base_dir = os.path.dirname(output_base)
+    if base_dir == "":
+        base_dir = "output"
+        output_base = os.path.join(base_dir, args.output_base)
+    # Create base directory
+    os.makedirs(output_base, exist_ok=True)
+    # Redirect slice directory to be inside the base directory
+    slice_dir_full = os.path.join(output_base, args.slice_dir)
+    args.slice_dir = slice_dir_full
+    os.makedirs(args.slice_dir, exist_ok=True)
     ifg_to_slice = args.ifg_path
 
     # Load IFG document to inspect metadata and nodes
@@ -410,14 +496,38 @@ if __name__ == "__main__":
     # If the user requested a gyroid infill, inject nodes into the IFG
     if args.infill_gyroid:
         cell_size, thickness = args.infill_gyroid
-        # Find the first Mesh node
+        # Find the Mesh node (benchy)
         mesh_node = next((n for n in doc["nodes"] if n["type"] == "Mesh"), None)
         if mesh_node is None:
             raise RuntimeError("Cannot add gyroid infill: no Mesh node found.")
-        # Create a Lattice node for the gyroid
-        infill_id = "infill_gyroid"
+        mesh_id = mesh_node["id"]
+
+        # 1) Create Transform "shrink" to make a slightly smaller copy of the mesh
+        shrink_id = "shrink"
+        shrink_node = {
+            "id": shrink_id,
+            "type": "Transform",
+            "params": {
+                "translate": [0, 0, 0],
+                "rotate": [0, 0, 0],
+                "scale": [0.98, 0.98, 0.98]
+            },
+            "inputs": [mesh_id]
+        }
+
+        # 2) Create Subtract "shell" = Mesh - shrink
+        shell_id = "shell"
+        shell_node = {
+            "id": shell_id,
+            "type": "Subtract",
+            "params": {},
+            "inputs": [mesh_id, shrink_id]
+        }
+
+        # 3) Create Lattice "gyroid"
+        lattice_id = "gyroid"
         lattice_node = {
-            "id": infill_id,
+            "id": lattice_id,
             "type": "Lattice",
             "params": {
                 "cell_size": cell_size,
@@ -425,33 +535,40 @@ if __name__ == "__main__":
             },
             "inputs": []
         }
-        # Create an Intersect node to carve the gyroid inside the mesh
-        intersect_id = "gyroid_interior"
+
+        # 4) Create Intersect "interiorGyroid" = shrink ∧ gyroid
+        intersect_id = "interiorGyroid"
         intersect_node = {
             "id": intersect_id,
             "type": "Intersect",
             "params": {},
-            "inputs": [mesh_node["id"], infill_id]
+            "inputs": [shrink_id, lattice_id]
         }
-        # Create a Union node to combine the mesh shell and the interior gyroid
-        final_id = "mesh_with_gyroid"
+
+        # 5) Create Union "final" = shell ∪ interiorGyroid
+        final_id = "final"
         union_node = {
             "id": final_id,
             "type": "Union",
             "params": {},
-            "inputs": [mesh_node["id"], intersect_id]
+            "inputs": [shell_id, intersect_id]
         }
-        # Append new nodes to the document
-        doc["nodes"].append(lattice_node)
-        doc["nodes"].append(intersect_node)
-        doc["nodes"].append(union_node)
-        # The last node is now the root for sampling
 
-        # After injecting nodes, write updated IFG to a temporary file
-        temp_ifg_path = args.ifg_path.replace(".ifg", "_infill.ifg")
+        # Append new nodes so that "final" is last
+        doc["nodes"].extend([
+            shrink_node,
+            shell_node,
+            lattice_node,
+            intersect_node,
+            union_node
+        ])
+
+        # Write updated IFG to a temporary file
+        temp_ifg_path = args.ifg_path.replace(".ifg", "_hollow_infill.ifg")
         with open(temp_ifg_path, "w") as tf:
             json.dump(doc, tf, indent=2)
-        # Use this new IFG for slicing
+
+        # Use the new IFG for slicing
         ifg_to_slice = temp_ifg_path
 
     # Now generate slices using (possibly) updated bounds
@@ -462,7 +579,7 @@ if __name__ == "__main__":
 
 
     if args.fmt == "pwsz":
-        output_file = f"{args.output_base}.pwsz"
+        output_file = f"{output_base}.pwsz"
         wrap_to_pwsz(
             slice_dir=args.slice_dir,
             output_file=output_file,
@@ -472,14 +589,23 @@ if __name__ == "__main__":
             layer_thickness=args.layer_thickness
         )
     else:  # args.fmt == "ctb"
-        output_file = f"{args.output_base}.ctb"
+        output_file = f"{output_base}.ctb"
         wrap_to_ctb(
-            slice_dir=args.slice_dir,
-            output_file=output_file,
-            bounds=bounds,
-            res_x=args.res_x,
-            res_y=args.res_y,
-            layer_thickness=args.layer_thickness
+            png_folder=args.slice_dir,
+            archive_path=output_file,
+            image_prefix="Slice",
+            width=args.res_x,
+            height=args.res_y,
+            num_layers=num_layers,
+            # Example exposure settings; adjust as needed
+            exposure_settings={
+                "exposure_time": 2000,
+                "bottom_exposure_time": 5000,
+                "bottom_layers": 5,
+                "z_lift_distance": 6.0,
+                "z_lift_speed": 5.0,
+                "z_retract_speed": 2.0
+            }
         )
 
     print("✅ Done.")
