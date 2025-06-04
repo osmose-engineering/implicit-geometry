@@ -1,179 +1,168 @@
-# Implicit Geometry File Format (IFG)
+# Implicit Geometry Toolkit (IGT)
 
-Jumpstart an open‐source, JSON‐centric format for defining implicit geometry. Our goal is to let designers describe shapes, lattices, Boolean operations, or even arbitrary meshes in a human‐readable graph, then slice directly—no mesh export or mesh‐to‐mesh conversion needed.
+This repository provides a small, open-source toolkit for defining, manipulating, and slicing implicit geometry. Rather than relying on meshes (and converting mesh to mesh), we let you describe shapes, lattices, mesh imports, and Boolean combinations as a simple JSON‐centric graph (IFG). A Python loader builds a signed‐distance function (SDF) from that graph, and a sampler produces 2D PNG slices and can package them into printer‐ready formats.
 
-## What’s Included
+---
 
-- **Schema/**: Minimal definitions for primitives (Cube, Sphere, Cylinder), transforms, booleans, lattices, and mesh nodes.
-- **Examples/**: `.ifg` files showing a 10 mm cube, a simple lattice‐in‐shell, or mesh‐based implicit bodies sourced from an STL.
-- **loader.py**: Python reference loader that reads an `.ifg`, builds the node graph, and evaluates the implicit field at any `(x,y,z)`, including support for signed‐distance evaluation of meshes (`Mesh` nodes).
-- **pwsz_converter/**: Contains `sampler.py`, which:
-  1. Automatically infers bounding boxes, if not provided, from any `Mesh` node.
-  2. Generates PNG slices layer by layer.
-  3. Packages them into either a `.ctb` (ChituBox/modern) or `.pwsz` (Anycubic Photon) file.
+## Key Components
 
-## Generating an IFG from an STL
+1. **Implicit File Format (IFG)**  
+   A human‐readable JSON format that describes an implicit shape as a directed acyclic graph of nodes.  
+   - **Primitives**: Sphere, Box, Cylinder, etc.  
+   - **Transforms**: Translate, Rotate, Scale.  
+   - **Boolean Operations**: Union, Intersect, Subtract.  
+   - **Lattices**: Gyroid, Voronoi, and other periodic/organic patterns.  
+   - **Mesh Nodes**: Point to an external STL, auto‐inferring bounds from the mesh for slicing.
 
-To convert any arbitrary watertight STL into an IFG with mesh support, use the provided helper script:
+2. **`implicit_core/loader.py`**  
+   Loads an IFG, traverses its nodes (primitive, mesh, Boolean, lattice), and constructs a Python function `eval_fn(x, y, z)` that returns a signed‐distance value.  
+   - Negative values indicate "inside" the shape, positive are "outside."  
+   - Mesh SDFs use `trimesh` and `rtree` to compute signed distances from vertices/faces.
 
-```bash
-python3 stl_to_ifg.py \
-  --stl path/to/your_part.stl \
-  --out path/to/your_part.ifg
-```
+3. **`sampler.py` (in the repo root)**  
+   Samples any IFG over its bounding box, layer by layer.  
+   - Produces a folder of PNG slice images (binary masks) at a user‐specified resolution and layer thickness.  
+   - Calls into the CTB exporter (`exporters/ctb_exporter.py`) to bundle PNGs into a `.ctb` archive with exposure settings.  
+   - Can also call the Anycubic exporter (`exporters/anycubic_exporter.py`) to create a `.pm7m`/`.pwsz` file.  
 
-This script:
-1. Loads the STL via `trimesh`, fills any holes, and computes `mesh.bounds`.
-2. Emits a minimal `.ifg` JSON with:
-   - `metadata.bounds` set to the mesh’s axis‐aligned bounding box.
-   - A single `Mesh` node pointing at the STL file path.
+4. **`implicit.py` (CLI Entry Point)**  
+   A single command‐line interface exposing all core functionality:  
+   - **`primitive`**: Generate standalone primitives (sphere, box, cylinder, etc.) as IFGs.  
+   - **`mesh`**: Convert an STL to a minimal IFG with a Mesh node.  
+   - **`combine`**: Apply Boolean operations (union/intersect/subtract) to one or more IFG files.  
+   - **`lattice`**: Create a periodic or organic lattice over a bounding box.  
+   - **`slice`**: Sample an IFG into PNGs and package as CTB or Anycubic format.
 
-Once generated, `your_part.ifg` can be sliced without further manual edits.
+5. **`exporters/ctb_exporter.py`**  
+   Takes a folder of PNG slices and metadata (resolution, layer thickness, exposure settings) to produce a `.ctb` file compatible with ChituBox and other CTB‐aware slicers.
 
-## Quick Start: From IFG to Slices
+6. **`exporters/anycubic_exporter.py`**  
+   Similar to the CTB exporter, but targets Anycubic Photon `.pm7m` (PWSZ) format. Wraps slice images and helper config files into a Photon Workshop–ready archive.
 
-1. **Clone the repo**  
+7. **Utilities and Examples**  
+   - **`stl_to_ifg.py`**: Convert any watertight STL into an IFG with a Mesh node (auto‐fills bounds).  
+   - **`tests/`**: Pytest test suite covering primitives, mesh SDF, lattices, CLI commands, slicing, and a full end‐to‐end demo.
+
+---
+
+## Quick Start
+
+1. **Install dependencies**  
    ```bash
-   git clone https://github.com/your‐org/ifg.git
-   cd ifg
+   pip3 install numpy pillow trimesh shapely rtree
    ```
 
-2. **Install dependencies**  
+2. **Generate a simple primitive**  
    ```bash
-   pip3 install pillow trimesh rtree
+   python3 implicit.py primitive sphere \
+     --center 0 0 0 \
+     --radius 1.0 \
+     --bounds -1 1 -1 1 -1 1 \
+     --output sphere.ifg
    ```
-
-3. **Generate an IFG (optional)**  
-   If you already have an STL and want to automate IFG creation:
-   ```bash
-   python3 stl_to_ifg.py \
-     --stl examples/my_part.stl \
-     --out examples/my_part.ifg
-   ```
-   Otherwise, proceed with any existing `.ifg` in `examples/`.
-
-4. **Verify the loader**  
-   ```bash
-   python3 loader.py examples/cube.ifg
-   ```
-   You should see:
-   ```
-   Field at (0,0,0): -5.0
-   ```
-   For a `Mesh`‐based IFG (e.g., `sphere_mesh.ifg`), you might see:
-   ```
-   Field at (0,0,0): -1.000000
-   ```
-
-5. **Generate slices & package**  
-   By default, we target CTB since it’s the more modern, feature‐rich ChituBox format. For example:
-   ```bash
-   python3 pwsz_converter/sampler.py \
-     --ifg examples/cube.ifg \
-     --out cube_print \
-     --dir output_slices \
-     --slice_thick 0.05 \
-     --resx 512 \
-     --resy 512 \
-     --format ctb
-   ```
-   This writes:
-   - `output_slices/slice_0000.png`, `slice_0001.png`, …  
-   - `cube_print.ctb` (ChituBox‐ready).
-
-   To target Anycubic’s `.pwsz`, swap `--format pwsz`:
-   ```bash
-   python3 pwsz_converter/sampler.py \
-     --format pwsz \
-     --ifg examples/cube.ifg \
-     --out cube_print \
-     --dir output_slices \
-     --slice_thick 0.05 \
-     --resx 512 \
-     --resy 512
-   ```
-   You’ll get `cube_print.pwsz`—loadable in Photon Workshop or Anycubic’s software.
-
-6. **Load into your slicer**  
-   - Open `cube_print.ctb` in ChituBox. You should see your layer stack with default exposure settings.  
-   - If you generated a `.pwsz`, drop it into Anycubic’s slicer. Verify layers appear correctly.
-
-### Gyroid Infill Support
-
-In addition to slicing solid implicit models, the `sampler.py` script can automatically generate gyroid infill within a mesh. You have two options:
-
-1. **On-the-fly infill via CLI**  
-   Pass the `--infill-gyroid <cell_size> <thickness>` arguments to `sampler.py` along with your IFG. For example:
-   ```bash
-   python3 pwsz_converter/sampler.py \
-     --ifg examples/benchy.ifg \
-     --out benchy_with_gyroid \
-     --dir output_slices \
-     --slice_thick 0.05 \
-     --resx 512 \
-     --resy 512 \
-     --format ctb \
-     --infill-gyroid 5.0 0.5
-   ```
-   This will:
-   - Create an inner (scaled) copy of the mesh to define a hollow shell.  
-   - Subtract the inner copy to extract a thin shell.  
-   - Generate a gyroid lattice (with `cell_size` and `thickness`) inside that shell.  
-   - Combine shell and infill into a single implicit tree.  
-   - Slice using a hybrid approach (planar shell + vectorized 2D gyroid) for fast performance.
-
-2. **Prebuilt infill IFG**  
-   Alternatively, write an IFG that contains:
+   This writes `sphere.ifg`:
    ```json
    {
-     "metadata": { "format_version": "0.1", "units": "mm", "bounds": {} },
-     "nodes": [
-       { "id": "mesh", "type": "Mesh", "params": { "filename": "examples/3dbenchy.stl" }, "inputs": [] },
-       { "id": "shrink", "type": "Transform", "params": { "translate":[0,0,0], "rotate":[0,0,0], "scale":[0.98,0.98,0.98] }, "inputs":["mesh"] },
-       { "id": "shell", "type": "Subtract", "params": {}, "inputs":["mesh","shrink"] },
-       { "id": "gyroid", "type": "Lattice", "params": { "cell_size":5.0, "thickness":0.5 }, "inputs":[] },
-       { "id": "interiorGyroid", "type": "Intersect", "params": {}, "inputs":["shrink","gyroid"] },
-       { "id": "final", "type": "Union", "params": {}, "inputs":["shell","interiorGyroid"] }
-     ]
+     "format": "implicit",
+     "bounds": { "xmin": -1, "xmax": 1, "ymin": -1, "ymax": 1, "zmin": -1, "zmax": 1 },
+     "sdf": { "kind": "sphere", "center": [0, 0, 0], "radius": 1.0 }
    }
    ```
-   Save it as, for example, `examples/benchy_hollow_gyroid.ifg`, then slice normally:
+
+3. **Slice the IFG to PNGs + CTB**  
    ```bash
-   python3 pwsz_converter/sampler.py \
-     --ifg examples/benchy_hollow_gyroid.ifg \
-     --out benchy_filled_hollow \
-     --dir output_slices \
-     --slice_thick 0.05 \
-     --resx 512 \
-     --resy 512 \
-     --format ctb
+   python3 implicit.py slice \
+     --ifg sphere.ifg \
+     --slice_dir sphere_slices \
+     --archive sphere.ctb \
+     --layer_thickness 0.5 \
+     --resx 64 \
+     --resy 64
    ```
-   The sampler will detect the shell + infill tree and use a fast hybrid slicing method that combines planar mesh sections (for the shell) and vectorized 2D gyroid masks for the interior.
+   - Produces `sphere_slices/slice_0000.png`, `slice_0001.png`, …  
+   - Bundles into `sphere.ctb` ready for ChituBox.
 
-Below either approach, the output PNG stack and final `.ctb` or `.pwsz` file will show the Benchy with a gyroid infill inside a thin shell.
+4. **Combine shapes and lattices**  
+   - Build a box, subtract a sphere, fill with a gyroid, slice to CTB:
+     ```bash
+     python3 implicit.py primitive box \
+       --center 0 0 0 --halfwidths 20 20 20 \
+       --bounds -20 20 -20 20 -20 20 --output box.ifg
 
-## Dynamic Bounds Detection
+     python3 implicit.py primitive sphere \
+       --center 0 0 0 --radius 17.5 \
+       --bounds -20 20 -20 20 -20 20 --output sphere.ifg
 
-`pwsz_converter/sampler.py` automatically checks for `metadata.bounds` in the IFG. If missing, it locates the first `Mesh` node, loads the STL, and uses `mesh.bounds` to infer:
-- `xmin, xmax, ymin, ymax, zmin, zmax`
+     python3 implicit.py combine \
+       --mode subtract --inputs box.ifg sphere.ifg \
+       --bounds -20 20 -20 20 -20 20 --output shell.ifg
 
-This removes the need to hand‐edit bounds for unknown meshes. Simply point at a `Mesh` node and let the code frame the slice region for you.
+     python3 implicit.py lattice periodic \
+       --type gyroid --cell_size 5.0 --thickness 0.0 \
+       --bounds -20 20 -20 20 -20 20 --output gyroid.ifg
+
+     python3 implicit.py combine \
+       --mode intersect --inputs shell.ifg gyroid.ifg \
+       --bounds -20 20 -20 20 -20 20 --output filled_shell.ifg
+
+     python3 implicit.py slice \
+       --ifg filled_shell.ifg \
+       --slice_dir demo_slices \
+       --archive filled_shell.ctb \
+       --layer_thickness 0.05 \
+       --resx 512 \
+       --resy 512
+     ```
+   - Final `filled_shell.ctb` contains a hollow box with a gyroid infill.
+
+---
+
+## File Structure Overview
+
+```
+├── implicit.py                   # CLI entry point
+├── sampler.py                    # Slices any IFG → PNGs + CTB
+├── stl_to_ifg.py                 # Convert STL → minimal IFG with Mesh node
+├── loader.py                     # Build eval_fn(x,y,z) from node‐based IFG
+├── implicit_core/
+│   ├── primitives.py             # Sphere, Box, Cylinder SDF definitions
+│   ├── mesh.py                   # Mesh → signed‐distance function (Trimesh)
+│   ├── lattice/
+│   │   ├── periodic.py           # Gyroid, Voronoi lattices
+│   │   └── organic.py            # Random/point‐based organic lattices
+│   └── loader.py                 # Core graph evaluator for node‐based IFG
+├── exporters/
+│   ├── ctb_exporter.py           # Bundle PNGs into .ctb archive
+│   └── anycubic_exporter.py       # Bundle PNGs into .pm7m/.pwsz archive
+└── tests/
+    ├── test_primitives_and_booleans.py
+    ├── test_mesh.py
+    ├── test_lattice.py
+    ├── test_organic.py
+    ├── test_implicit.py
+    ├── test_sampler.py
+    └── test_demo.py              # End‐to‐end workflow verification
+```
+
+---
+
+## Testing
+
+Run `pytest` at the repo root to validate everything:
+- Primitives and Boolean operations return correct signed‐distance values.  
+- Mesh‐import SDF and lattice generation work as intended.  
+- CLI commands produce valid IFG files.  
+- Sampler slices a sphere into PNGs and produces a CTB.  
+- The full demo (create shapes, boolean, lattice, slice) completes without error.
+
+---
 
 ## Next Steps
 
-- Create and combine primitive shapes (Cube, Sphere, Cylinder, etc.) directly in IFG; no STL needed.
-- Extend `loader.py` to add more implicit primitives (Torus, Sweep profiles, etc.).
-- Enhance `sampler.py` to allow custom CTB parameters (e.g., exposure times, resin profiles).
-- Add more example IFGs under `examples/` (nested Booleans, multi‐material lattices, complex meshes).
-- Write automated tests to confirm each IFG node evaluates correctly (primitives, lattices, meshes).
+- **Expand Primitives**: Add torus, sweep profiles, custom 2D‐to‐3D extrusions.  
+- **New Lattices**: Cellular, TPMS families, user‐defined unit cell shapes.  
+- **GPU‐Accelerated Slicing**: Swap Python loops for CUDA/OpenCL backends.  
+- **Additional Exporters**: Support 3MF, SLC, or other printer formats.  
+- **Interactive Viewer**: A minimal GUI (Qt or WebGL) for real‐time slice previews.
 
-## Contributing
-
-Contributions welcome—fork, open issues, or send pull requests for:
-- Expanding the IFG schema (new node types, composite operations).
-- GPU‐accelerated sampling (CUDA or OpenCL backends).
-- Support for other slice formats (SLC, GF, proprietary formats).
-
-## License
-
-Distributed under Apache 2.0. See `LICENSE` for details.
+For contributions, open issues or PRs. Let’s build a fully open, mesh‐free CAD + slicing workflow together!  
